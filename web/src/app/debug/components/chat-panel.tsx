@@ -166,6 +166,23 @@ function readFileAsText(file: File): Promise<string> {
   });
 }
 
+type TextExtractResponse = {
+  filename: string;
+  type: string;
+  size: number;
+  text: string;
+};
+
+/** Convert a dataUrl back to a File for server-side upload */
+function dataUrlToFile(dataUrl: string, name: string): File {
+  const [header, b64] = dataUrl.split(",", 2);
+  const mime = header.split(";")[0].replace("data:", "");
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new File([bytes], name, { type: mime });
+}
+
 export function ChatPanel() {
   const [mode, setMode] = useState<Mode>("chat");
   const [model, setModel] = useState("auto");
@@ -208,10 +225,9 @@ export function ChatPanel() {
         fileRec.dataUrl = await readFileAsDataUrl(file);
       } else if (isTextFile(file.name, file.type)) {
         fileRec.textContent = await readFileAsText(file);
-        // Also store a dataUrl for the preview badge
         fileRec.dataUrl = await readFileAsDataUrl(file);
       } else {
-        // Binary files — just read as dataUrl for later upload, no text extraction
+        // Binary files — just store dataUrl, text will be extracted server-side on submit
         fileRec.dataUrl = await readFileAsDataUrl(file);
       }
       newFiles.push(fileRec);
@@ -252,6 +268,30 @@ export function ChatPanel() {
     return parts;
   };
 
+  /** Upload binary files to backend for text extraction, returns true on success */
+  const extractBinaryFiles = async (files: AttachedFile[]): Promise<boolean> => {
+    const binaryFiles = files.filter((f) => !isImageFile(f.type) && !isTextFile(f.name, f.type));
+    if (binaryFiles.length === 0) return true;
+    for (const file of binaryFiles) {
+      try {
+        setLoadingText(`正在提取「${file.name}」的文本内容...`);
+        const formData = new FormData();
+        const f = dataUrlToFile(file.dataUrl, file.name);
+        formData.append("file", f);
+        const result = await httpRequest<TextExtractResponse>("/api/extract-text", {
+          method: "POST",
+          body: formData,
+        });
+        file.textContent = result.text || "(空内容)";
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setError(`提取「${file.name}」失败: ${msg}`);
+        return false;
+      }
+    }
+    return true;
+  };
+
   const submit = async () => {
     const content = input.trim();
     if ((!content && attachedFiles.length === 0) || loading) return;
@@ -260,6 +300,13 @@ export function ChatPanel() {
     setInput("");
     setLoading(true);
     setError("");
+
+    // First, extract text from binary files via backend
+    if (!(await extractBinaryFiles(currentFiles))) {
+      setLoading(false);
+      setLoadingText("");
+      return;
+    }
 
     if (mode === "search") {
       if (!content) {
