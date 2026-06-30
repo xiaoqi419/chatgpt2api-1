@@ -197,6 +197,36 @@ export function ChatPanel() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const chatMessages = useMemo<ChatMessage[]>(() => turns.flatMap((turn) => turn.mode === "chat" ? [{ role: turn.role, content: turn.content }] : []), [turns]);
 
+  const STORAGE_KEY = "chatgpt2api_chat_turns";
+
+  // Restore turns from localStorage on mount
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const restored = JSON.parse(raw) as Turn[];
+        if (Array.isArray(restored) && restored.length > 0) {
+          setTurns(restored);
+        }
+      }
+    } catch {
+      // silently ignore
+    }
+  }, []);
+
+  // Save turns to localStorage whenever they change
+  useEffect(() => {
+    try {
+      if (turns.length > 0) {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(turns));
+      } else {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch {
+      // silently ignore (storage may be full)
+    }
+  }, [turns]);
+
   useEffect(() => {
     let active = true;
     void fetchModels().then((data) => {
