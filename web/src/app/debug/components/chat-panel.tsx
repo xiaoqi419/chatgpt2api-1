@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ExternalLink, Globe2, Image, LoaderCircle, RotateCcw, X } from "lucide-react";
+import { ArrowUp, ExternalLink, FileText, Globe2, ImageIcon, LoaderCircle, Paperclip, RotateCcw, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -15,10 +15,47 @@ import { cn } from "@/lib/utils";
 import type { ChatCompletionResponse, ChatMessage, MessageContentPart, SearchResult } from "./types";
 
 type Mode = "chat" | "search";
-type AttachedImage = { dataUrl: string; name: string; type: string };
-type ChatTurn = { mode: "chat"; role: "user" | "assistant"; content: string; images?: string[] };
+type AttachedFile = { dataUrl: string; textContent?: string; name: string; type: string; size: number };
+type ChatTurn = { mode: "chat"; role: "user" | "assistant"; content: string; files?: AttachedFile[] };
 type SearchTurn = { mode: "search"; prompt: string; result?: SearchResult; error?: string; elapsedMs?: number };
 type Turn = ChatTurn | SearchTurn;
+
+const TEXT_EXTENSIONS = new Set([
+  "txt", "md", "json", "csv", "tsv", "xml", "yaml", "yml", "toml", "ini", "cfg", "conf",
+  "js", "ts", "jsx", "tsx", "py", "rb", "go", "rs", "java", "c", "cpp", "h", "hpp",
+  "css", "scss", "less", "html", "htm", "vue", "svelte",
+  "sh", "bash", "zsh", "ps1", "bat", "cmd",
+  "log", "env", "gitignore", "dockerfile", "makefile",
+  "sql", "r", "m", "swift", "kt", "scala", "php",
+  "tex", "bib", "rst", "asciidoc", "adoc",
+  "plist", "properties", "cfg", "config",
+]);
+
+const TEXT_MIME_PREFIXES = [
+  "text/",
+  "application/json",
+  "application/xml",
+  "application/yaml",
+  "application/javascript",
+  "application/typescript",
+  "application/x-sh",
+];
+
+function isTextFile(name: string, mime: string): boolean {
+  if (TEXT_MIME_PREFIXES.some((p) => mime.startsWith(p))) return true;
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  return TEXT_EXTENSIONS.has(ext);
+}
+
+function isImageFile(mime: string): boolean {
+  return mime.startsWith("image/");
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 const normalizeMarkdown = (text: string) =>
   text
@@ -111,12 +148,21 @@ function SearchResultView({ turn }: { turn: SearchTurn }) {
   );
 }
 
-function readFileAsDataUrl(file: File): Promise<AttachedImage> {
+function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve({ dataUrl: reader.result as string, name: file.name, type: file.type });
-    reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error(`读取文件失败: ${file.name}`));
     reader.readAsDataURL(file);
+  });
+}
+
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error(`读取文件失败: ${file.name}`));
+    reader.readAsText(file);
   });
 }
 
@@ -129,7 +175,7 @@ export function ChatPanel() {
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState("");
   const [error, setError] = useState("");
-  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const chatMessages = useMemo<ChatMessage[]>(() => turns.flatMap((turn) => turn.mode === "chat" ? [{ role: turn.role, content: turn.content }] : []), [turns]);
@@ -154,36 +200,63 @@ export function ChatPanel() {
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
-    const newImages: AttachedImage[] = [];
+    const newFiles: AttachedFile[] = [];
     for (const file of Array.from(files)) {
-      if (!file.type.startsWith("image/")) continue;
-      const image = await readFileAsDataUrl(file);
-      newImages.push(image);
+      if (file.size > 50 * 1024 * 1024) continue; // skip files > 50MB
+      const fileRec: AttachedFile = { name: file.name, type: file.type, size: file.size, dataUrl: "" };
+      if (isImageFile(file.type)) {
+        fileRec.dataUrl = await readFileAsDataUrl(file);
+      } else if (isTextFile(file.name, file.type)) {
+        fileRec.textContent = await readFileAsText(file);
+        // Also store a dataUrl for the preview badge
+        fileRec.dataUrl = await readFileAsDataUrl(file);
+      } else {
+        // Binary files — just read as dataUrl for later upload, no text extraction
+        fileRec.dataUrl = await readFileAsDataUrl(file);
+      }
+      newFiles.push(fileRec);
     }
-    setAttachedImages((prev) => [...prev, ...newImages]);
-    // Reset file input so the same file can be selected again
+    setAttachedFiles((prev) => [...prev, ...newFiles]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const removeAttachedImage = (index: number) => {
-    setAttachedImages((prev) => prev.filter((_, i) => i !== index));
+  const removeAttachedFile = (index: number) => {
+    setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
   };
 
-  const buildMessageContent = (text: string, images: AttachedImage[]): string | MessageContentPart[] => {
-    if (images.length === 0) return text;
+  const buildMessageContent = (text: string, files: AttachedFile[]): string | MessageContentPart[] => {
+    if (files.length === 0) return text;
     const parts: MessageContentPart[] = [];
-    if (text) parts.push({ type: "text", text });
-    for (const img of images) {
-      parts.push({ type: "image_url", image_url: { url: img.dataUrl } });
+
+    // Build text preamble from attached non-image files
+    const textParts: string[] = [];
+    for (const file of files) {
+      if (isImageFile(file.type)) continue; // images go as image_url
+      if (file.textContent) {
+        textParts.push(`以下为附件「${file.name}」的内容（${formatFileSize(file.size)}）：\n\`\`\`\n${file.textContent}\n\`\`\``);
+      } else {
+        textParts.push(`[附件: ${file.name} (${formatFileSize(file.size)})]`);
+      }
     }
+    if (text || textParts.length > 0) {
+      parts.push({ type: "text", text: [text, ...textParts].filter(Boolean).join("\n\n") });
+    }
+
+    // Add images as image_url parts
+    for (const file of files) {
+      if (isImageFile(file.type) && file.dataUrl) {
+        parts.push({ type: "image_url", image_url: { url: file.dataUrl } });
+      }
+    }
+
     return parts;
   };
 
   const submit = async () => {
     const content = input.trim();
-    if ((!content && attachedImages.length === 0) || loading) return;
-    const currentImages = [...attachedImages];
-    setAttachedImages([]);
+    if ((!content && attachedFiles.length === 0) || loading) return;
+    const currentFiles = [...attachedFiles];
+    setAttachedFiles([]);
     setInput("");
     setLoading(true);
     setError("");
@@ -212,11 +285,10 @@ export function ChatPanel() {
       return;
     }
 
-    const userContent = buildMessageContent(content, currentImages);
+    const userContent = buildMessageContent(content, currentFiles);
     const nextMessages: ChatMessage[] = [...chatMessages, { role: "user", content: userContent }];
 
-    // Show user turn with image dataUrls so they can be rendered
-    setTurns((current) => [...current, { mode: "chat", role: "user", content, images: currentImages.map((img) => img.dataUrl) }]);
+    setTurns((current) => [...current, { mode: "chat", role: "user", content, files: currentFiles }]);
 
     setLoadingText("正在回复...");
     try {
@@ -248,16 +320,25 @@ export function ChatPanel() {
                     ? "rounded-3xl bg-stone-950 px-5 py-3 text-white dark:bg-white dark:text-stone-950"
                     : "text-stone-800 dark:text-stone-100",
                 )}>
-                  {turn.images && turn.images.length > 0 && (
+                  {/* Attached files display */}
+                  {turn.files && turn.files.length > 0 && (
                     <div className="flex flex-wrap gap-2">
-                      {turn.images.map((dataUrl, imgIndex) => (
-                        <img
-                          key={imgIndex}
-                          src={dataUrl}
-                          alt={`附件 ${imgIndex + 1}`}
-                          className="h-32 w-auto max-w-full rounded-lg object-cover"
-                        />
-                      ))}
+                      {turn.files.map((file, fileIndex) =>
+                        isImageFile(file.type) ? (
+                          <img
+                            key={fileIndex}
+                            src={file.dataUrl}
+                            alt={file.name}
+                            className="h-32 w-auto max-w-full rounded-lg object-cover"
+                          />
+                        ) : (
+                          <div key={fileIndex} className="flex items-center gap-1.5 rounded-lg bg-white/10 px-2.5 py-1.5 text-xs text-white dark:bg-stone-900 dark:text-stone-200">
+                            <FileText className="size-3.5 shrink-0" />
+                            <span className="truncate max-w-[120px]">{file.name}</span>
+                            <span className="shrink-0 opacity-60">{formatFileSize(file.size)}</span>
+                          </div>
+                        )
+                      )}
                     </div>
                   )}
                   {turn.content && (
@@ -283,19 +364,26 @@ export function ChatPanel() {
       <div className="mx-auto w-full max-w-3xl">
         {error ? <div className="mb-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/25 dark:text-rose-300">{error}</div> : null}
         <div className="overflow-hidden rounded-[28px] border border-stone-200 bg-white shadow-[0_18px_70px_-45px_rgba(15,23,42,0.55)] dark:border-white/10 dark:bg-stone-950/90">
-          {/* Image preview strip */}
-          {attachedImages.length > 0 && (
+          {/* File preview strip */}
+          {attachedFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 border-b border-stone-100 px-5 pt-3 dark:border-white/10">
-              {attachedImages.map((img, index) => (
+              {attachedFiles.map((file, index) => (
                 <div key={index} className="group relative">
-                  <img
-                    src={img.dataUrl}
-                    alt={img.name}
-                    className="h-16 w-16 rounded-lg object-cover ring-1 ring-stone-200 dark:ring-white/10"
-                  />
+                  {isImageFile(file.type) ? (
+                    <img
+                      src={file.dataUrl}
+                      alt={file.name}
+                      className="h-16 w-16 rounded-lg object-cover ring-1 ring-stone-200 dark:ring-white/10"
+                    />
+                  ) : (
+                    <div className="flex h-16 w-28 items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2.5 text-xs dark:border-white/10 dark:bg-white/[0.04]">
+                      <FileText className="size-4 shrink-0 text-stone-500 dark:text-stone-400" />
+                      <span className="min-w-0 truncate leading-tight text-stone-700 dark:text-stone-300">{file.name}</span>
+                    </div>
+                  )}
                   <button
                     type="button"
-                    onClick={() => removeAttachedImage(index)}
+                    onClick={() => removeAttachedFile(index)}
                     className="absolute -top-1.5 -right-1.5 flex size-5 items-center justify-center rounded-full bg-stone-800 text-white shadow-sm opacity-0 transition group-hover:opacity-100"
                   >
                     <X className="size-3" />
@@ -316,11 +404,10 @@ export function ChatPanel() {
             }}
             className="min-h-[88px] resize-none border-0 bg-transparent px-5 pt-5 text-[15px] leading-7 shadow-none focus-visible:ring-0 dark:text-stone-100"
           />
-          {/* Hidden file input */}
+          {/* Hidden file input — accept all types */}
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
             multiple
             className="hidden"
             onChange={(event) => { void handleFileSelect(event); }}
@@ -350,16 +437,16 @@ export function ChatPanel() {
                 size="icon"
                 className="size-9 rounded-full border-stone-200 bg-white"
                 onClick={() => fileInputRef.current?.click()}
-                title="上传图片"
+                title="上传文件（图片、文档、文本等）"
               >
-                <Image className="size-4" />
+                <Paperclip className="size-4" />
               </Button>
               <Button
                 type="button"
                 variant="outline"
                 size="icon"
                 className="size-9 rounded-full border-stone-200 bg-white"
-                onClick={() => { setTurns([]); setError(""); setAttachedImages([]); }}
+                onClick={() => { setTurns([]); setError(""); setAttachedFiles([]); }}
                 title="清空对话"
               >
                 <RotateCcw className="size-4" />
@@ -367,7 +454,7 @@ export function ChatPanel() {
               <button
                 type="button"
                 onClick={() => void submit()}
-                disabled={loading || (!input.trim() && attachedImages.length === 0)}
+                disabled={loading || (!input.trim() && attachedFiles.length === 0)}
                 className="inline-flex size-9 items-center justify-center rounded-full bg-stone-950 text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300 dark:bg-white dark:text-stone-950 dark:hover:bg-stone-200"
               >
                 {loading ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowUp className="size-4" />}
