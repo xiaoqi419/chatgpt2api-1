@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ExternalLink, Globe2, LoaderCircle, RotateCcw } from "lucide-react";
+import { ArrowUp, ExternalLink, Globe2, Image, LoaderCircle, RotateCcw, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -12,10 +12,11 @@ import { fetchModels } from "@/lib/api";
 import { httpRequest } from "@/lib/request";
 import { cn } from "@/lib/utils";
 
-import type { ChatCompletionResponse, ChatMessage, SearchResult } from "./types";
+import type { ChatCompletionResponse, ChatMessage, MessageContentPart, SearchResult } from "./types";
 
 type Mode = "chat" | "search";
-type ChatTurn = { mode: "chat"; role: "user" | "assistant"; content: string };
+type AttachedImage = { dataUrl: string; name: string; type: string };
+type ChatTurn = { mode: "chat"; role: "user" | "assistant"; content: string; images?: string[] };
 type SearchTurn = { mode: "search"; prompt: string; result?: SearchResult; error?: string; elapsedMs?: number };
 type Turn = ChatTurn | SearchTurn;
 
@@ -52,6 +53,7 @@ function MarkdownResult({ content }: { content: string }) {
         blockquote: ({ className, ...props }) => <blockquote className={cn("my-5 border-l-4 border-stone-300 bg-white/70 py-3 pr-4 pl-5 text-stone-700 dark:border-white/20 dark:bg-white/[0.04] dark:text-stone-300", className)} {...props} />,
         code: ({ className, ...props }) => <code className={cn("rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[0.9em] text-stone-800 dark:bg-white/10 dark:text-stone-100", className)} {...props} />,
         pre: ({ className, ...props }) => <pre className={cn("my-5 overflow-x-auto rounded-xl border border-stone-200 bg-stone-950 p-4 text-sm text-stone-50 dark:border-white/10", className)} {...props} />,
+        img: ({ className, ...props }) => <img className={cn("max-h-96 w-auto rounded-xl object-contain", className)} {...props} />,
       }}
     >
       {content}
@@ -109,6 +111,15 @@ function SearchResultView({ turn }: { turn: SearchTurn }) {
   );
 }
 
+function readFileAsDataUrl(file: File): Promise<AttachedImage> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ dataUrl: reader.result as string, name: file.name, type: file.type });
+    reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+}
+
 export function ChatPanel() {
   const [mode, setMode] = useState<Mode>("chat");
   const [model, setModel] = useState("auto");
@@ -118,6 +129,8 @@ export function ChatPanel() {
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState("");
   const [error, setError] = useState("");
+  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const chatMessages = useMemo<ChatMessage[]>(() => turns.flatMap((turn) => turn.mode === "chat" ? [{ role: turn.role, content: turn.content }] : []), [turns]);
 
@@ -138,14 +151,49 @@ export function ChatPanel() {
     if (viewport) viewport.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
   }, [turns, loading]);
 
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    const newImages: AttachedImage[] = [];
+    for (const file of Array.from(files)) {
+      if (!file.type.startsWith("image/")) continue;
+      const image = await readFileAsDataUrl(file);
+      newImages.push(image);
+    }
+    setAttachedImages((prev) => [...prev, ...newImages]);
+    // Reset file input so the same file can be selected again
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const removeAttachedImage = (index: number) => {
+    setAttachedImages((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const buildMessageContent = (text: string, images: AttachedImage[]): string | MessageContentPart[] => {
+    if (images.length === 0) return text;
+    const parts: MessageContentPart[] = [];
+    if (text) parts.push({ type: "text", text });
+    for (const img of images) {
+      parts.push({ type: "image_url", image_url: { url: img.dataUrl } });
+    }
+    return parts;
+  };
+
   const submit = async () => {
     const content = input.trim();
-    if (!content || loading) return;
+    if ((!content && attachedImages.length === 0) || loading) return;
+    const currentImages = [...attachedImages];
+    setAttachedImages([]);
     setInput("");
     setLoading(true);
     setError("");
 
     if (mode === "search") {
+      if (!content) {
+        setError("搜索模式下请输入文字");
+        setLoading(false);
+        return;
+      }
       const start = Date.now();
       setLoadingText("搜索中...");
       const index = turns.length;
@@ -164,11 +212,18 @@ export function ChatPanel() {
       return;
     }
 
-    const nextMessages: ChatMessage[] = [...chatMessages, { role: "user", content }];
+    const userContent = buildMessageContent(content, currentImages);
+    const nextMessages: ChatMessage[] = [...chatMessages, { role: "user", content: userContent }];
+
+    // Show user turn with image dataUrls so they can be rendered
+    setTurns((current) => [...current, { mode: "chat", role: "user", content, images: currentImages.map((img) => img.dataUrl) }]);
+
     setLoadingText("正在回复...");
-    setTurns((current) => [...current, { mode: "chat", role: "user", content }]);
     try {
-      const result = await httpRequest<ChatCompletionResponse>("/v1/chat/completions", { method: "POST", body: { model, messages: nextMessages } });
+      const result = await httpRequest<ChatCompletionResponse>("/v1/chat/completions", {
+        method: "POST",
+        body: { model, messages: nextMessages },
+      });
       setTurns((current) => [...current, { mode: "chat", role: "assistant", content: String(result.choices?.[0]?.message?.content || "") }]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -188,12 +243,26 @@ export function ChatPanel() {
             ) : (
               <div key={`chat-${index}`} className={cn("mx-auto flex max-w-3xl", turn.role === "user" ? "justify-end" : "justify-start")}>
                 <div className={cn(
-                  "max-w-[86%] whitespace-pre-wrap text-[15px] leading-7",
+                  "max-w-[86%] space-y-3 text-[15px] leading-7",
                   turn.role === "user"
                     ? "rounded-3xl bg-stone-950 px-5 py-3 text-white dark:bg-white dark:text-stone-950"
                     : "text-stone-800 dark:text-stone-100",
                 )}>
-                  {turn.content}
+                  {turn.images && turn.images.length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {turn.images.map((dataUrl, imgIndex) => (
+                        <img
+                          key={imgIndex}
+                          src={dataUrl}
+                          alt={`附件 ${imgIndex + 1}`}
+                          className="h-32 w-auto max-w-full rounded-lg object-cover"
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {turn.content && (
+                    <div className="whitespace-pre-wrap">{turn.content}</div>
+                  )}
                 </div>
               </div>
             ))}
@@ -214,6 +283,27 @@ export function ChatPanel() {
       <div className="mx-auto w-full max-w-3xl">
         {error ? <div className="mb-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/25 dark:text-rose-300">{error}</div> : null}
         <div className="overflow-hidden rounded-[28px] border border-stone-200 bg-white shadow-[0_18px_70px_-45px_rgba(15,23,42,0.55)] dark:border-white/10 dark:bg-stone-950/90">
+          {/* Image preview strip */}
+          {attachedImages.length > 0 && (
+            <div className="flex flex-wrap gap-2 border-b border-stone-100 px-5 pt-3 dark:border-white/10">
+              {attachedImages.map((img, index) => (
+                <div key={index} className="group relative">
+                  <img
+                    src={img.dataUrl}
+                    alt={img.name}
+                    className="h-16 w-16 rounded-lg object-cover ring-1 ring-stone-200 dark:ring-white/10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeAttachedImage(index)}
+                    className="absolute -top-1.5 -right-1.5 flex size-5 items-center justify-center rounded-full bg-stone-800 text-white shadow-sm opacity-0 transition group-hover:opacity-100"
+                  >
+                    <X className="size-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <Textarea
             value={input}
             onChange={(event) => setInput(event.target.value)}
@@ -225,6 +315,15 @@ export function ChatPanel() {
               }
             }}
             className="min-h-[88px] resize-none border-0 bg-transparent px-5 pt-5 text-[15px] leading-7 shadow-none focus-visible:ring-0 dark:text-stone-100"
+          />
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(event) => { void handleFileSelect(event); }}
           />
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-stone-100 px-4 py-3 dark:border-white/10">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -245,10 +344,32 @@ export function ChatPanel() {
               </div>
             </div>
             <div className="flex gap-2">
-              <Button type="button" variant="outline" size="icon" className="size-9 rounded-full border-stone-200 bg-white" onClick={() => { setTurns([]); setError(""); }} title="清空对话">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="size-9 rounded-full border-stone-200 bg-white"
+                onClick={() => fileInputRef.current?.click()}
+                title="上传图片"
+              >
+                <Image className="size-4" />
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="size-9 rounded-full border-stone-200 bg-white"
+                onClick={() => { setTurns([]); setError(""); setAttachedImages([]); }}
+                title="清空对话"
+              >
                 <RotateCcw className="size-4" />
               </Button>
-              <button type="button" onClick={() => void submit()} disabled={loading || !input.trim()} className="inline-flex size-9 items-center justify-center rounded-full bg-stone-950 text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300 dark:bg-white dark:text-stone-950 dark:hover:bg-stone-200">
+              <button
+                type="button"
+                onClick={() => void submit()}
+                disabled={loading || (!input.trim() && attachedImages.length === 0)}
+                className="inline-flex size-9 items-center justify-center rounded-full bg-stone-950 text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300 dark:bg-white dark:text-stone-950 dark:hover:bg-stone-200"
+              >
                 {loading ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowUp className="size-4" />}
               </button>
             </div>
