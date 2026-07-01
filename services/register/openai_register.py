@@ -510,6 +510,9 @@ class PlatformRegistrar:
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
+        self._do_register_user(email, password, index)
+
+    def _do_register_user(self, email: str, password: str, index: int) -> None:
         url = f"{auth_base}/api/accounts/user/register"
         headers = self._json_headers(f"{auth_base}/create-account/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id,
@@ -537,6 +540,33 @@ class PlatformRegistrar:
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "提交注册密码完成")
+
+    def _register_user_with_retry(self, email: str, password: str, index: int) -> None:
+        """注册用户，遇到 409 invalid_state 时重新 authorize 再重试，最多 3 次"""
+        for attempt in range(1, 4):
+            try:
+                self._do_register_user(email, password, index)
+                return
+            except RuntimeError as e:
+                err_str = str(e)
+                if attempt < 3 and "409" in err_str and "invalid_state" in err_str:
+                    step(index, f"会话过期（attempt {attempt}），重新获取注册会话后重试", "yellow")
+                    old_session = self.session
+                    self.session = create_session(self.proxy)
+                    self.device_id = str(uuid.uuid4())
+                    self.clearance_user_agent = ""
+                    try:
+                        old_session.close()
+                    except Exception:
+                        pass
+                    try:
+                        self._platform_authorize(email, index)
+                    except Exception as auth_err:
+                        raise RuntimeError(f"重新 authorize 失败: {auth_err}")
+                    time.sleep(1)
+                    continue
+                raise
+        raise RuntimeError(f"注册失败: 重试 3 次仍遇到 409 invalid_state，email={email}")
 
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
@@ -631,7 +661,7 @@ class PlatformRegistrar:
             password = _random_password()
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
-            self._register_user(email, password, index)
+            self._register_user_with_retry(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
             code = wait_for_code(mailbox)
